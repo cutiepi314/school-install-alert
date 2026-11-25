@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "School - block EXE downloads",
+  "version": "1.0.0",
+  "description": "Cancels browser downloads whose final filename ends in .exe. School classroom helper; users can disable unpacked extensions.",
+  "permissions": ["downloads"],
+  "background": {"service_worker": "background.js"}
+}

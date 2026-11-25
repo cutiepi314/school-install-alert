@@ -1,0 +1,6 @@
+*.log
+*.jsonl
+*.zip
+Outbox/
+Processed/
+BrowserPolicyBackup.json
