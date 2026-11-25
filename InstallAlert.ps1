@@ -8,24 +8,60 @@ No software is installed, blocked, or removed by this script.
 param(
     [ValidateSet('Student', 'Teacher')][string]$Mode = 'Student',
     [string]$AlertFolder = '',
+    [string]$DiscordWebhook = '',
     [string]$DataFolder = (Join-Path $env:LOCALAPPDATA 'SchoolInstallAlert'),
     [switch]$NoSpeech,
     [switch]$TestAlert,
     [ValidateRange(0, 86400)][int]$RunSeconds = 0
 )
 
+# --- Easy Configuration ---
+# Paste your Discord webhook URL between the quotes below so Enable-Autostart.cmd
+# and Test-Voice.cmd send alerts automatically without extra parameters.
+$DefaultDiscordWebhook = 'https://discord.com/api/webhooks/1575080596252794960/PkLza9GK_Xt0zmTumPcFTCPL84lULMEzeok1OwNSEsXarfeI67MWD7KlWpFfAkbFLe-p'
+# Set to $true if you want student PCs to stay silent and only send alerts to Discord.
+$DefaultNoSpeech = $false
+
+# Customize what the voice and Discord notifications say.
+# Placeholders: {computer}, {kind}, {detail}, {time}
+$SpeechMessages = @{
+    Installed         = 'Software installation completed on {computer}. {detail}'
+    Test              = 'Test alert from {computer}. Installation monitoring is working.'
+    Possible          = 'Possible software installation on {computer}. Please check this computer.'
+    InstallerActivity = 'Possible software installation on {computer}. Please check this computer.'
+    StudentStart      = 'Installation monitoring started.'
+    TeacherStart      = 'Teacher installation alerts started.'
+}
+$DiscordMessages = @{
+    Installed         = '[{time}] **{computer}** | Installed: {detail}'
+    Test              = '[{time}] **{computer}** | Test alert: {detail}'
+    Possible          = '[{time}] **{computer}** | Possible install: {detail}'
+    InstallerActivity = '[{time}] **{computer}** | Installer activity: {detail}'
+}
+# --- End Configuration ---
+
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
     throw 'Use Windows PowerShell 5.1 (powershell.exe), not PowerShell 7.'
 }
+if (-not $DiscordWebhook -and $DefaultDiscordWebhook) {
+    $DiscordWebhook = $DefaultDiscordWebhook
+}
+$DiscordWebhook = $DiscordWebhook.Trim()
+if ($DiscordWebhook -and $DiscordWebhook -notmatch '^https://((canary|ptb)\.)?discord(app)?\.com/api/webhooks/\d+/[A-Za-z0-9._-]+$') {
+    throw 'Invalid -DiscordWebhook URL. Expected https://discord.com/api/webhooks/...'
+}
+$speechDisabled = $NoSpeech.IsPresent -or $DefaultNoSpeech
 if ($Mode -eq 'Teacher' -and -not $AlertFolder) {
     throw 'Teacher mode requires -AlertFolder, for example C:\InstallAlerts.'
 }
 [void][IO.Directory]::CreateDirectory($DataFolder)
 $outbox = Join-Path $DataFolder 'Outbox'
+$discordOutbox = Join-Path $DataFolder 'DiscordOutbox'
 $processed = Join-Path $DataFolder 'Processed'
 [void][IO.Directory]::CreateDirectory($outbox)
+[void][IO.Directory]::CreateDirectory($discordOutbox)
 [void][IO.Directory]::CreateDirectory($processed)
 $script:synth = $null
 $watcher = $null
@@ -34,6 +70,7 @@ $sourceMsi = 'SchoolInstallAlert.Msi.' + [guid]::NewGuid().ToString('N')
 $lastAlert = @{}
 $lastSpeech = [datetime]::MinValue
 $lastNetworkWarning = [datetime]::MinValue
+$lastDiscordWarning = [datetime]::MinValue
 $started = Get-Date
 $instanceMutex = $null
 $ownsMutex = $false
@@ -42,6 +79,11 @@ function Clean-Text([string]$Value, [int]$Length = 160) {
     $valueClean = ($Value -replace '[\x00-\x1f\x7f]', ' ').Trim()
     if ($valueClean.Length -gt $Length) { return $valueClean.Substring(0, $Length) }
     return $valueClean
+}
+
+function Format-AlertMessage([hashtable]$Templates, [string]$Kind, [string]$Computer, [string]$Detail, [string]$TimeLocal) {
+    $template = if ($Templates.ContainsKey($Kind)) { $Templates[$Kind] } else { $Templates['Possible'] }
+    return $template.Replace('{computer}', $Computer).Replace('{kind}', $Kind).Replace('{detail}', $Detail).Replace('{time}', $TimeLocal)
 }
 
 function Say([string]$Text) {
@@ -58,17 +100,14 @@ function Show-Alert($Alert) {
     $computer = Clean-Text ([string]$Alert.Computer) 64
     $detail = Clean-Text ([string]$Alert.Detail)
     $kind = [string]$Alert.Kind
-    Write-Host ('[{0}] {1} | {2} | {3}' -f (Get-Date -Format HH:mm:ss), $computer, $kind, $detail) -ForegroundColor Yellow
+    $timeLocal = Get-Date -Format 'HH:mm:ss'
+    Write-Host ('[{0}] {1} | {2} | {3}' -f $timeLocal, $computer, $kind, $detail) -ForegroundColor Yellow
     $dailyLog = Join-Path $DataFolder ('Alerts-{0}.jsonl' -f (Get-Date -Format yyyy-MM-dd))
     $Alert | ConvertTo-Json -Compress | Add-Content -LiteralPath $dailyLog -Encoding UTF8
     # Every alert is logged; speech is limited to one alert per five seconds.
     if (((Get-Date) - $script:lastSpeech).TotalSeconds -ge 5) {
         $script:lastSpeech = Get-Date
-        switch ($kind) {
-            'Installed' { Say "Software installation completed on $computer. $detail" }
-            'Test' { Say "Test alert from $computer. Installation monitoring is working." }
-            default { Say "Possible software installation on $computer. Please check this computer." }
-        }
+        Say (Format-AlertMessage $SpeechMessages $kind $computer $detail $timeLocal)
     }
 }
 
@@ -92,6 +131,9 @@ function Publish-Alert([string]$Kind, [string]$Detail, [string]$Key) {
     if ($AlertFolder) {
         $alert | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $outbox ($alert.Id + '.json')) -Encoding UTF8
     }
+    if ($DiscordWebhook) {
+        $alert | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $discordOutbox ($alert.Id + '.json')) -Encoding UTF8
+    }
 }
 
 function Flush-Outbox {
@@ -109,6 +151,41 @@ function Flush-Outbox {
             if (((Get-Date) - $script:lastNetworkWarning).TotalMinutes -ge 1) {
                 Write-Warning ('Teacher delivery failed. Alerts stay in the local Outbox for retry. ' + $_.Exception.Message)
                 $script:lastNetworkWarning = Get-Date
+            }
+            break
+        }
+    }
+}
+
+function Flush-DiscordOutbox {
+    if (-not $DiscordWebhook) { return }
+    $files = @(Get-ChildItem -LiteralPath $discordOutbox -Filter '*.json' -File | Sort-Object CreationTimeUtc | Select-Object -First 10)
+    if ($files.Count -eq 0) { return }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch {}
+    foreach ($file in $files) {
+        try {
+            $alert = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $computer = Clean-Text ([string]$alert.Computer) 64
+            $detail = Clean-Text ([string]$alert.Detail) 160
+            $kind = [string]$alert.Kind
+            $timeLocal = try { [datetimeoffset]::Parse([string]$alert.TimeUtc).ToLocalTime().ToString('HH:mm:ss') } catch { Get-Date -Format 'HH:mm:ss' }
+            $content = Format-AlertMessage $DiscordMessages $kind $computer $detail $timeLocal
+            if ($content.Length -gt 1900) { $content = $content.Substring(0, 1900) }
+            $payload = @{
+                content          = $content
+                username         = 'School Install Alert'
+                allowed_mentions = @{ parse = @() }
+            } | ConvertTo-Json -Compress -Depth 4
+            $bodyBytes = [Text.Encoding]::UTF8.GetBytes($payload)
+            [void](Invoke-RestMethod -Uri $DiscordWebhook -Method Post -Body $bodyBytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 10)
+            Remove-Item -LiteralPath $file.FullName
+            Start-Sleep -Milliseconds 300
+        } catch {
+            if (((Get-Date) - $script:lastDiscordWarning).TotalMinutes -ge 1) {
+                Write-Warning ('Discord delivery failed. Alerts stay in DiscordOutbox for retry. ' + $_.Exception.Message)
+                $script:lastDiscordWarning = Get-Date
             }
             break
         }
@@ -153,7 +230,7 @@ try {
         catch [Threading.AbandonedMutexException] { $ownsMutex = $true }
         if (-not $ownsMutex) { Write-Host 'Already running in this Windows session.'; return }
     }
-    if (-not $NoSpeech) {
+    if (-not $speechDisabled) {
         try {
             Add-Type -AssemblyName System.Speech
             $script:synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
@@ -164,11 +241,13 @@ try {
     Write-Host "School Install Alert | $Mode mode | Ctrl+C to stop" -ForegroundColor Cyan
     Write-Host "Local logs: $DataFolder"
     if ($AlertFolder) { Write-Host "Teacher alert folder: $AlertFolder" }
+    if ($DiscordWebhook) { Write-Host 'Discord webhook: configured' }
 
     if ($TestAlert) {
         if ($Mode -ne 'Student') { throw 'Use -TestAlert with Student mode.' }
         Publish-Alert 'Test' 'Simulated alert; no software was installed.' 'Test'
         Flush-Outbox
+        Flush-DiscordOutbox
         if ($script:synth) {
             while ($script:synth.State -ne 'Ready') { Start-Sleep -Milliseconds 100 }
         }
@@ -201,10 +280,10 @@ try {
             Write-Warning 'Using process-name polling. Processes lasting less than one second may be missed.'
         }
         Write-Host "Monitoring active: process events=$processActive; process polling=$pollingActive; MSI events=$msiActive"
-        Say 'Installation monitoring started.'
+        Say $SpeechMessages['StudentStart']
     } else {
         if (-not (Test-Path -LiteralPath $AlertFolder -PathType Container)) { throw 'The teacher alert folder does not exist or is not accessible.' }
-        Say 'Teacher installation alerts started.'
+        Say $SpeechMessages['TeacherStart']
     }
 
     $nextFlush = [datetime]::MinValue
@@ -255,6 +334,7 @@ try {
             }
             if ((Get-Date) -ge $nextFlush) {
                 Flush-Outbox
+                Flush-DiscordOutbox
                 $nextFlush = (Get-Date).AddSeconds(5)
             }
         }

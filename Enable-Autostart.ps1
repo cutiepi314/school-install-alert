@@ -3,6 +3,7 @@
 param(
     [ValidateSet('Student','Teacher')][string]$Mode = 'Student',
     [string]$AlertFolder = '',
+    [string]$DiscordWebhook = '',
     [switch]$NoSpeech,
     [switch]$Preview
 )
@@ -11,10 +12,12 @@ if ($Mode -eq 'Teacher' -and -not $AlertFolder) { throw 'Teacher mode needs -Ale
 $launcher = Join-Path $PSScriptRoot 'Run-Background.ps1'
 if (-not (Test-Path -LiteralPath $launcher)) { throw 'Keep all package files together in a permanent folder.' }
 if ($AlertFolder -match '["\r\n]') { throw 'Invalid alert-folder path.' }
+if ($DiscordWebhook -match '["\r\n]') { throw 'Invalid Discord webhook URL.' }
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $taskName = "SchoolInstallAlert-$Mode-$sid"
 $arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Mode {1}' -f $launcher, $Mode
 if ($AlertFolder) { $arguments += ' -AlertFolder "{0}"' -f $AlertFolder }
+if ($DiscordWebhook) { $arguments += ' -DiscordWebhook "{0}"' -f $DiscordWebhook }
 if ($NoSpeech) { $arguments += ' -NoSpeech' }
 $exeXml = [Security.SecurityElement]::Escape((Join-Path $PSHOME 'powershell.exe'))
 $argsXml = [Security.SecurityElement]::Escape($arguments)
